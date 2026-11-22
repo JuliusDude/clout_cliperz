@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .captions import phrase, write_captions
+from .cover import write_cover_script
 from .storage import ClipperError, digest, read_json, save_json
 
 
@@ -161,8 +162,9 @@ def probe(path):
     raise ClipperError(f"Could not determine the video duration of {path.name}.")
 
 
-def video_filter(layout):
-    base = "[0:V:0]fps=30,scale=w='max(2,round(iw*if(gt(sar,0),sar,1)/2)*2)':h=ih,setsar=1"
+def framing_filter(layout, *, cover=False):
+    frames = "select='not(mod(n,6))',thumbnail=n=16" if cover else "fps=30"
+    base = f"[0:V:0]{frames},scale=w='max(2,round(iw*if(gt(sar,0),sar,1)/2)*2)':h=ih,setsar=1"
     if layout == "crop":
         framing = base + ",scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
     else:
@@ -171,51 +173,82 @@ def video_filter(layout):
                    "boxblur=12:2,eq=brightness=-0.14:saturation=0.72,scale=1080:1920[back];"
                    "[fg]scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2[front];"
                    "[back][front]overlay=(W-w)/2:(H-h)/2")
-    return framing + ",setsar=1,ass=captions.ass,format=yuv420p[v]"
+    return framing + ",setsar=1"
 
 
 def create_title(clip, source_title):
     text = phrase(clip.words)
-    split = re.split(r'(?<=[.!?。！？])\s+', text, maxsplit=1)[0]
-    title = re.sub(r"[<>\x00-\x1f]", "", split).strip() or source_title
+    sentences = re.split(r'(?<=[.!?。！？])\s+', text)
+    # Pull a self-contained hook directly from the speaker's words.
+    def hook_score(line):
+        if not 10 <= len(line) <= 95:
+            return 0
+        if line.endswith(("?", "？")):
+            return 3
+        if re.match(r"^(how|why|here['’]s|imagine|try)\b", line, re.I) or re.search(r"\b\d+\b", line):
+            return 2
+        return 1
+
+    hook = max(sentences, key=hook_score)
+    title = re.sub(r"[<>\x00-\x1f]", "", hook).strip() or source_title
     if len(title) > 95:
         shortened = title[:94].rsplit(" ", 1)[0].rstrip(" ,")
         title = (shortened or title[:94]) + "…"
     return title
 
 
-def make_clip(path, clip, media_id, source_title, origin, has_audio, layout, highlight, output):
+def make_clip(path, clip, media_id, source_title, origin, has_audio, layout, highlight, output, caption_style="pop"):
     # The upload identity stays stable across style changes and reruns.
     upload_key = digest(f"{media_id}/{clip.start}/{clip.end}")[:32]
     words = [(w.start, w.end, w.text, w.boundary) for w in clip.words]
-    style = digest(json.dumps(["render-v2", upload_key, layout, highlight, words], ensure_ascii=False))[:12]
+    style = digest(json.dumps(["render-v4", upload_key, layout, highlight, caption_style, words], ensure_ascii=False))[:12]
     folder = output / "clips" / f"{upload_key[:12]}-{style}"
-    if all((folder / name).is_file() for name in ("short.mp4", "captions.srt", "details.json")):
+    if all((folder / name).is_file() for name in ("short.mp4", "captions.srt", "thumbnail.jpg", "details.json")):
         return folder, read_json(folder / "details.json")
     folder.parent.mkdir(parents=True, exist_ok=True)
     details = {
         "title": create_title(clip, source_title), "source_title": source_title,
-        "description": (f"From {source_title}\n{origin}\n\n" if origin else "") + "#Shorts",
+        "description": "",
         "start_seconds": clip.start / 1000, "end_seconds": clip.end / 1000,
-        "upload_key": upload_key,
+        "upload_key": upload_key, "caption_style": caption_style, "thumbnail": "thumbnail.jpg",
     }
+    sentences = re.split(r'(?<=[.!?。！？])\s+', phrase(clip.words))
+    excerpt = next((s for s in sentences if s != details["title"] and len(s) >= 12), "")
+    excerpt = re.sub(r"[<>\x00-\x1f]", "", excerpt).strip()
+    if len(excerpt) > 220:
+        excerpt = excerpt[:219].rsplit(" ", 1)[0] + "…"
+    credit = f"From {source_title}\n{origin}" if origin else ""
+    details["description"] = "\n\n".join(part for part in (excerpt, credit, "#Shorts") if part)
     with tempfile.TemporaryDirectory(dir=folder.parent) as tmp:
         stage = Path(tmp) / "render"
         stage.mkdir()
-        write_captions(clip, stage, highlight)
+        write_captions(clip, stage, highlight, caption_style)
         args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                 "-ss", f"{clip.start / 1000:.3f}", "-i", str(path)]
         if not has_audio:
             args += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
         args += ["-t", f"{(clip.end - clip.start) / 1000:.3f}",
-                 "-filter_complex_threads", "2", "-filter_complex", video_filter(layout),
+                 "-filter_complex_threads", "2", "-filter_complex",
+                 framing_filter(layout) + ",ass=captions.ass,format=yuv420p[v]",
                  "-map", "[v]", "-map", "0:a:0" if has_audio else "1:a:0",
                  "-c:v", "libx264", "-threads", "4", "-preset", "veryfast", "-crf", "21",
-                 "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+                 "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-map_metadata", "-1",
                  "-movflags", "+faststart", "short.mp4"]
         print(f"Rendering {details['start_seconds']:.1f}–{details['end_seconds']:.1f}s …", flush=True)
         execute(args, cwd=stage)
+        write_cover_script(details["title"], stage / "cover.ass")
+        sample = clip.start + (clip.end - clip.start) // 5
+        cover_args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                      "-ss", f"{sample / 1000:.3f}", "-t", f"{min(8000, clip.end - sample) / 1000:.3f}",
+                      "-i", str(path), "-filter_complex_threads", "2", "-filter_complex",
+                      framing_filter(layout, cover=True) + ",setpts=PTS-STARTPTS,ass=cover.ass[v]",
+                      "-map", "[v]", "-frames:v", "1", "-q:v", "2", "-threads", "2",
+                      "-map_metadata", "-1", "thumbnail.jpg"]
+        execute(cover_args, cwd=stage)
+        if not (stage / "thumbnail.jpg").is_file():
+            raise ClipperError("Could not extract a source frame for the clip thumbnail.")
         (stage / "captions.ass").unlink()
+        (stage / "cover.ass").unlink()
         save_json(stage / "details.json", details)
         if folder.exists():  # Restore missing members of a previously generated bundle.
             for item in stage.iterdir():

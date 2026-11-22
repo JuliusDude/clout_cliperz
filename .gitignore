@@ -2,5 +2,9 @@
 __pycache__/
 *.pyc
 client_secret*.json
+.env
+youtube.json
+token.json
+.state/
 inbox/
 shorts-output/

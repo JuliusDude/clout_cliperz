@@ -11,8 +11,10 @@ from .media import VIDEO_ID
 from .storage import ClipperError, file_hash, read_json, save_json
 
 
-SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly"]
 INSERT = "https://www.googleapis.com/upload/youtube/v3/videos"
+VIDEO_STATUS = "https://www.googleapis.com/youtube/v3/videos"
+SET_THUMBNAIL = "https://www.googleapis.com/upload/youtube/v3/thumbnails/set"
 CHUNK_SIZE = 8 * 1024 * 1024  # YouTube requires multiples of 256 KiB.
 TRANSIENT = {408, 429, 500, 502, 503, 504}
 
@@ -37,7 +39,7 @@ def connect(client_file):
     client = read_json(client_file)
     if not client or "installed" not in client:
         raise ClipperError("Choose the OAuth client JSON for a Google Desktop app.")
-    flow = InstalledAppFlow.from_client_config(client, [SCOPE])
+    flow = InstalledAppFlow.from_client_config(client, SCOPES)
     credentials = flow.run_local_server(
         host="127.0.0.1", port=0, access_type="offline", prompt="consent",
         authorization_prompt_message="Open this link to choose the destination YouTube channel:\n{url}",
@@ -45,6 +47,8 @@ def connect(client_file):
     )
     if not credentials.refresh_token:
         raise ClipperError("Google did not grant offline access. Run connect again to authorize the worker.")
+    if credentials.granted_scopes and not set(SCOPES).issubset(credentials.granted_scopes):
+        raise ClipperError("Grant both upload and read access to check processing and apply thumbnails.")
     save_json(token_path(), json.loads(credentials.to_json()))
     print("YouTube connected. The worker can now upload to the channel you selected.")
 
@@ -53,12 +57,14 @@ def session():
     data = read_json(token_path())
     if not data:
         raise ClipperError("Connect your channel first: python shorts.py connect client_secret.json")
+    if not set(SCOPES).issubset(data.get("scopes", [])):
+        raise ClipperError("Reconnect with python shorts.py connect client_secret.json to enable thumbnail processing checks.")
     try:
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import AuthorizedSession
     except ImportError as error:
         raise ClipperError("Install requirements.txt before publishing.") from error
-    return AuthorizedSession(Credentials.from_authorized_user_info(data, [SCOPE]))
+    return AuthorizedSession(Credentials.from_authorized_user_info(data, SCOPES))
 
 
 def api_error(response):
@@ -120,7 +126,12 @@ def publish(client, folder, details, state, privacy, audience):
         raise ClipperError(f"The rendered video is empty: {video}")
     fingerprint = file_hash(video)
     if record and record.get("fingerprint") != fingerprint:
-        raise ClipperError("A different render of this clip has an unfinished upload. Retry the original render.")
+        for original in folder.parent.glob(details["upload_key"][:12] + "-*/short.mp4"):
+            if original != video and file_hash(original) == record.get("fingerprint"):
+                video, size = original, original.stat().st_size
+                break
+        else:
+            raise ClipperError("The unfinished upload needs its original MP4. Restore the original render to resume.")
     position = None
     failures = 0
     with video.open("rb") as stream:
@@ -185,6 +196,56 @@ def publish(client, folder, details, state, privacy, audience):
             if failures >= 5:
                 raise ClipperError("Upload interrupted. Retry with the same output folder to resume.")
             time.sleep(min(16, 2 ** (failures - 1)))
+
+
+def publish_with_thumbnail(client, folder, details, state, privacy, audience):
+    import requests
+
+    thumbnail = folder / "thumbnail.jpg"
+    checksum = file_hash(thumbnail)
+    ident = publish(client, folder, details, state, privacy, audience)
+    receipt = state / "uploads" / (details["upload_key"] + ".json")
+    record = read_json(receipt)
+    if record.get("thumbnail_sha256") == checksum:
+        return ident
+
+    params = {"part": "processingDetails,status", "id": ident,
+              "fields": "items(processingDetails(processingStatus,processingFailureReason),status(uploadStatus))"}
+    processed = False
+    for delay in (0, 5, 10, 20, 30, 45, 60):
+        if delay:
+            time.sleep(delay)
+        try:
+            if not processed:
+                response = client.get(VIDEO_STATUS, params=params, timeout=(15, 45))
+                if response.status_code in TRANSIENT:
+                    continue
+                if response.status_code != 200:
+                    raise api_error(response)
+                items = response.json().get("items", [])
+                item = items[0] if items else {}
+                progress = item.get("processingDetails", {})
+                status = progress.get("processingStatus")
+                if status in {"failed", "terminated"} or item.get("status", {}).get("uploadStatus") in {"failed", "rejected", "deleted"}:
+                    reason = progress.get("processingFailureReason") or item.get("status", {}).get("uploadStatus")
+                    raise ClipperError(f"YouTube could not process video {ident} ({reason or status}). Check Studio.")
+                processed = status == "succeeded"
+                if not processed:
+                    continue
+            with thumbnail.open("rb") as content:
+                response = client.post(SET_THUMBNAIL, params={"videoId": ident, "uploadType": "media"},
+                                       headers={"Content-Type": "image/jpeg"}, data=content, timeout=(15, 90))
+            if response.status_code in TRANSIENT or response.status_code == 404:
+                continue
+            if response.status_code != 200:
+                raise api_error(response)
+        except (requests.Timeout, requests.ConnectionError):
+            continue
+        record["thumbnail_sha256"] = checksum
+        save_json(receipt, record)
+        print(f"Thumbnail applied: https://www.youtube.com/shorts/{ident}", flush=True)
+        return ident
+    raise ClipperError(f"Video {ident} is uploaded. Its thumbnail is pending. Rerun the same job to finish.")
 
 
 def reconcile(folder, existing_id):

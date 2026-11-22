@@ -133,7 +133,7 @@ def phrase(words):
     return "".join(parts)
 
 
-def highlights(words, duration, seconds, count):
+def _pick_highlights(words, duration, seconds, count):
     maximum = seconds * 1000
     groups = []
     first = 0
@@ -182,7 +182,35 @@ def highlights(words, duration, seconds, count):
         selected.append(Clip(start, end, tuple(words[lo:hi])))
         if len(selected) == count:
             break
+    if len(selected) < count:
+        # A high-scoring passage can straddle two valid shorter passages.
+        # Earliest finish gives the maximum number of disjoint eligible ranges.
+        compatible = []
+        last_end = 0
+        for option in sorted(options, key=lambda o: (o[2], -o[0])):
+            _, start, end, _, _ = option
+            if start >= last_end and end - start >= minimum:
+                compatible.append(option)
+                last_end = end
+        if len(compatible) > len(selected):
+            top = sorted(compatible, key=lambda o: (-o[0], o[1]))[:count]
+            selected = [Clip(start, end, tuple(words[lo:hi])) for _, start, end, lo, hi in top]
     return sorted(selected, key=lambda c: c.start)
+
+
+def highlights(words, duration, seconds, count):
+    best = _pick_highlights(words, duration, seconds, count)
+    while len(best) < count and seconds > 5:
+        # Shorter passages can fit between the starts of adjacent sentences.
+        # Keep the longer selection when shortening does not yield more clips.
+        seconds = max(5, int(seconds * 0.72))
+        try:
+            selection = _pick_highlights(words, duration, seconds, count)
+        except ClipperError:
+            break
+        if len(selection) > len(best):
+            best = selection
+    return best
 
 
 def width(text):
@@ -259,18 +287,29 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
 
-def ass_text(group, split, active):
+def escape_ass(text):
+    return text.replace("\\", "＼").replace("{", "｛").replace("}", "｝")
+
+
+def ass_text(group, split, active, style):
     parts = []
     for i, w in enumerate(group):
         if i:
             parts.append(r"\N" if i == split else separator(group[i - 1].text, w.text))
-        text = w.text.replace("\\", "＼").replace("{", "｛").replace("}", "｝")
-        parts.append(r"{\c&H69E8FF&}" + text + r"{\r}" if i == active else text)
+        text = escape_ass(w.text)
+        if i == active:
+            emphasis = (r"{\c&H60EEFF&\fscx110\fscy110\t(0,100,\fscx100\fscy100)}"
+                        if style == "pop" else r"{\c&H69E8FF&}")
+            text = emphasis + text + r"{\r}"
+        parts.append(text)
     return "".join(parts)
 
 
-def write_captions(clip, folder, word_highlighting):
-    srt, events = [], [ASS_HEADER]
+def write_captions(clip, folder, word_highlighting, style="classic"):
+    header = ASS_HEADER
+    if style == "pop":
+        header = header.replace("Caption,Arial,76", "Caption,Arial,84").replace("1,4.4,1.5,2,", "1,6,2.5,2,")
+    srt, events = [], [header]
     for n, group in enumerate(caption_groups(clip.words), 1):
         split = line_split(group)
         text = "\n".join(phrase(part) for part in (group[:split], group[split:]) if part)
@@ -280,7 +319,10 @@ def write_captions(clip, folder, word_highlighting):
             a = group[i].start - clip.start if i is not None else start
             b = group[i + 1].start - clip.start if i is not None and i + 1 < len(group) else end
             if clock(a, True) != clock(b, True):
-                line = ass_text(group, split, i)
+                line = ass_text(group, split, i, style)
+                if style == "pop" and i is None:
+                    # An SRT has phrase timing only. Animate the phrase as a unit.
+                    line = r"{\fad(45,0)\c&H9AFAFF&}" + line
                 events.append(f"Dialogue: 0,{clock(a, True)},{clock(b, True)},Caption,,0,0,0,,{line}\n")
     (folder / "captions.srt").write_text("".join(srt), encoding="utf-8")
     (folder / "captions.ass").write_text("".join(events), encoding="utf-8")

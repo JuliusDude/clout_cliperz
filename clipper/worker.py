@@ -3,6 +3,7 @@ import sys
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -13,7 +14,26 @@ from .media import (EXTENSIONS, VIDEO_ID, channel_handle, channel_id, download, 
 from .storage import ClipperError, cached_hash, digest, read_json, save_json, signature, work_lock
 
 
-def run_source(source, args, client, state):
+@dataclass
+class Source:
+    path: Path
+    title: str
+    origin: str | None
+    media_id: str
+    duration: int
+    has_audio: bool
+    words: list
+    caption_path: Path
+    word_highlighting: bool
+    snapshot: tuple
+
+    def check_unchanged(self):
+        current = (signature(self.path), signature(self.caption_path) if self.caption_path.is_file() else None)
+        if current != self.snapshot:
+            raise ClipperError("The video or captions changed during processing. Retry when the copy finishes.")
+
+
+def prepare_source(source, args, state):
     origin = None
     if urlsplit(str(source)).scheme in {"http", "https"}:
         ident = video_id(str(source))
@@ -35,16 +55,38 @@ def run_source(source, args, client, state):
     before = (signature(path), signature(sidecar) if sidecar else None)
     media_id = cached_hash(path, state)
     words = transcript(path, sidecar, media_id, state, args.model, args.language, duration, audio_offset)
-    chosen = highlights(words, duration, args.seconds, args.clips)
-    bundles = [make_clip(path, clip, media_id, title, origin, has_audio, args.layout,
-                         sidecar is None, args.output) for clip in chosen]
-    after = (signature(path), signature(candidate) if candidate.is_file() else None)
-    if after != before:
-        raise ClipperError("The video or captions changed during processing. Retry when the copy finishes.")
-    for folder, details in bundles:
-        print(f"Captioned Short: {folder / 'short.mp4'}", flush=True)
-        if client is not None:
-            publisher.publish(client, folder, details, state, args.publish, args.audience)
+    prepared = Source(path, title, origin, media_id, duration, has_audio, words, candidate, sidecar is None, before)
+    prepared.check_unchanged()
+    return prepared
+
+
+def finish_clips(source, clips, args, client, state):
+    rendered = completed = 0
+    for clip in clips:
+        source.check_unchanged()
+        try:
+            folder, details = make_clip(source.path, clip, source.media_id, source.title, source.origin,
+                                        source.has_audio, args.layout, source.word_highlighting,
+                                        args.output, args.caption_style)
+            source.check_unchanged()
+            rendered += 1
+            print(f"Captioned Short: {folder / 'short.mp4'}\nThumbnail: {folder / 'thumbnail.jpg'}", flush=True)
+            if client is not None:
+                publisher.publish_with_thumbnail(client, folder, details, state, args.publish, args.audience)
+            completed += 1
+        except Exception as error:
+            print(f"Could not finish {source.title} at {clip.start / 1000:.1f}s: {error}", file=sys.stderr, flush=True)
+    return rendered, completed
+
+
+def run_source(source, args, client, state):
+    video = prepare_source(source, args, state)
+    chosen = highlights(video.words, video.duration, args.seconds, args.clips)
+    if len(chosen) < args.clips:
+        print(f"Found {len(chosen)} of {args.clips} requested nonoverlapping clips in {video.title}.", flush=True)
+    _, completed = finish_clips(video, chosen, args, client, state)
+    if completed != len(chosen):
+        raise ClipperError(f"Completed {completed} of {len(chosen)} clips. Rerun to finish the pending work.")
 
 
 def try_source(source, args, client, state):
@@ -64,7 +106,7 @@ def input_signature(path):
 def scan_folder(inbox, args, client, state):
     inbox.mkdir(parents=True, exist_ok=True)
     config = [str(inbox), args.model, args.language, args.seconds, args.clips,
-              args.layout, args.publish, args.audience]
+              args.layout, args.publish, args.audience, args.caption_style]
     marker = state / "folders" / (digest(json.dumps(config)) + ".json")
     seen = read_json(marker, {})
     files = sorted(p for p in inbox.iterdir() if p.is_file() and not p.name.startswith(".")
@@ -146,6 +188,8 @@ def watch(args, client, state):
     handle = channel_handle(args.source)
     if not (channel or handle) and "://" in args.source:
         raise ClipperError("For channel watching, use a YouTube channel URL, @handle or UC… channel ID.")
+    if getattr(args, "command", None) == "follow" and not (channel or handle):
+        raise ClipperError("Follow needs a YouTube channel URL, @handle, or UC… channel ID.")
     if args.include_latest and not (channel or handle):
         raise ClipperError("--include-latest applies to a YouTube channel feed.")
     inbox = Path(args.source).expanduser().resolve() if not (channel or handle) else None
