@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="shorts-session" content="__SESSION__">
+<title>Clout Cliperz</title>
+<link rel="stylesheet" href="/style.css">
+<script defer src="/app.js"></script>
+</head>
+<body>
+<header><div class="shell bar"><div class="brand"><span aria-hidden="true">▶</span> Clout Cliperz</div><span id="status" role="status">Connecting…</span></div></header>
+<main class="shell">
+<div class="intro"><h1>Shorts studio</h1><p>Turn long videos into captioned Shorts with custom thumbnails.</p></div>
+<div class="workspace">
+<section class="panel"><h2>Create Shorts</h2>
+<form id="job">
+<fieldset class="modes"><legend>Video source</legend>
+<label><input type="radio" name="mode" value="links" checked> Paste links</label>
+<label><input type="radio" name="mode" value="follow"> Follow channel</label></fieldset>
+<div id="links"><label for="urls">YouTube video links</label><textarea id="urls" rows="4" placeholder="Paste one YouTube link per line"></textarea><label class="check"><input type="checkbox" id="perVideo"> Apply clip count to each video</label></div>
+<div id="follow" hidden><label for="channel">YouTube channel</label><input id="channel" placeholder="@channel, channel URL, or ID"><label class="check"><input type="checkbox" id="latest"> Include the latest upload</label></div>
+<div class="fields">
+<label>Clip count<input type="number" id="count" value="3" min="1" max="20" required></label>
+<label>Max seconds<input type="number" id="seconds" value="35" min="5" max="180" required></label>
+<label>Caption style<select id="caption"><option value="pop">Pop</option><option value="classic">Classic</option></select></label>
+<label>Destination<select id="visibility"><option value="local">Save locally</option><option value="private">YouTube private</option><option value="unlisted">YouTube unlisted</option><option value="public">YouTube public</option></select></label>
+</div>
+<p id="error" role="alert" hidden></p>
+<div class="actions"><button id="start">Create Shorts</button><button type="button" id="stop" disabled>Stop job</button></div>
+</form></section>
+<section class="panel activity"><h2>Activity</h2><pre id="log" tabindex="0" aria-label="Worker activity">Waiting for a job.</pre></section>
+</div>
+<section class="library"><h2>Clip library</h2>
+<div id="clips" class="clips"></div>
+<div id="empty" class="empty"><img src="/example.jpg" alt="Example portrait thumbnail showing the moon"><div><h3>Your clips will appear here</h3><p>Start a job to preview your Shorts and download their captions and thumbnails.</p><small>Example thumbnail pictured</small></div></div>
+</section>
+</main>
+</body>
+</html>

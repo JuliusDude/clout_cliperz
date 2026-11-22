@@ -153,3 +153,14 @@ python shorts.py reconcile "shorts-output/clips/CLIP_FOLDER" --retry
 The Google token is stored under your user configuration directory in `shorts-clipper/youtube.json`. Set `SHORTS_CLIPPER_TOKEN` to choose a different token file. Keep the token, client JSON, and upload session state private.
 
 To run the regression checks, use `python -m unittest discover -s tests -v` in the activated environment.
+
+## Browser dashboard
+
+Run `python web.py` from the repository after installing the worker dependencies. Open
+[the local dashboard](http://127.0.0.1:8765) on the same computer. The page shares
+the worker's output folder and YouTube authorization. Choose **Save locally** to
+generate clips without connecting YouTube. Use the setup above to enable posting.
+
+The dashboard runs one job at a time. Closing the browser leaves the job running
+while the server stays on. **Stop job** stops the active batch or watcher. Stop
+the server with Ctrl+C. Use `--port` or `--output` to override its defaults.
