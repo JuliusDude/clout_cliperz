@@ -1,0 +1,12 @@
+[Unit]
+Description=Caption new videos and publish YouTube Shorts
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/shorts-clipper
+ExecStart=%h/shorts-clipper/.venv/bin/python -u shorts.py watch inbox --publish public
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target

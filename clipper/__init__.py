@@ -1,0 +1,1 @@
+"""Captioned YouTube Shorts automation."""
