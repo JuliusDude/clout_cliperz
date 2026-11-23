@@ -8,7 +8,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .media import VIDEO_ID
-from .storage import ClipperError, file_hash, read_json, save_json
+from .storage import ClipperError, existing_thumbnail, file_hash, read_json, save_json
+from .workflows import CLOUT_CUTS, CLOUT_HANDLE, MOVIE_RECAP, WORKFLOWS
 
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly"]
@@ -23,15 +24,17 @@ class RetryUpload(Exception):
     pass
 
 
-def token_path():
-    override = os.environ.get("SHORTS_CLIPPER_TOKEN")
+def token_path(workflow=CLOUT_CUTS):
+    recap = workflow == MOVIE_RECAP
+    override = os.environ.get("SHORTS_CLIPPER_MOVIE_RECAP_TOKEN" if recap else "SHORTS_CLIPPER_TOKEN")
     if override:
         return Path(override).expanduser().resolve()
     base = os.environ.get("APPDATA" if os.name == "nt" else "XDG_CONFIG_HOME")
-    return (Path(base) if base else Path.home() / ".config") / "shorts-clipper" / "youtube.json"
+    filename = "youtube-movie-recap.json" if recap else "youtube.json"
+    return (Path(base) if base else Path.home() / ".config") / "shorts-clipper" / filename
 
 
-def connect(client_file):
+def connect(client_file, workflow=CLOUT_CUTS):
     try:
         from google_auth_oauthlib.flow import InstalledAppFlow
     except ImportError as error:
@@ -42,29 +45,59 @@ def connect(client_file):
     flow = InstalledAppFlow.from_client_config(client, SCOPES)
     credentials = flow.run_local_server(
         host="127.0.0.1", port=0, access_type="offline", prompt="consent",
-        authorization_prompt_message="Open this link to choose the destination YouTube channel:\n{url}",
+        authorization_prompt_message=f"Open this link to choose the {WORKFLOWS[workflow]} destination channel:\n{{url}}",
         success_message="YouTube authorization received. You can return to Shorts Clipper.",
     )
     if not credentials.refresh_token:
         raise ClipperError("Google did not grant offline access. Run connect again to authorize the worker.")
     if credentials.granted_scopes and not set(SCOPES).issubset(credentials.granted_scopes):
         raise ClipperError("Grant both upload and read access to check processing and apply thumbnails.")
-    save_json(token_path(), json.loads(credentials.to_json()))
-    print("YouTube connected. The worker can now upload to the channel you selected.")
+    if workflow != MOVIE_RECAP:
+        from google.auth.transport.requests import AuthorizedSession
+        with AuthorizedSession(credentials) as client:
+            verify_clout_channel(client)
+    save_json(token_path(workflow), json.loads(credentials.to_json()))
+    print(f"YouTube connected for {WORKFLOWS[workflow]}. The worker can now upload to the channel you selected.")
 
 
-def session():
-    data = read_json(token_path())
+def verify_clout_channel(client):
+    endpoint = "https://www.googleapis.com/youtube/v3/channels"
+
+    def channel_ids(filters):
+        response = client.get(endpoint, params={"part": "id", **filters}, timeout=30)
+        if response.status_code != 200:
+            raise api_error(response)
+        return [item["id"] for item in response.json().get("items", [])]
+
+    expected = channel_ids({"forHandle": CLOUT_HANDLE})
+    if len(expected) != 1 or channel_ids({"mine": "true"}) != expected:
+        raise ClipperError(f"Choose {CLOUT_HANDLE} in Google authorization before uploading.")
+
+
+def connection_command(workflow):
+    suffix = "" if workflow == CLOUT_CUTS else f" --workflow {workflow}"
+    return f"python shorts.py connect client_secret.json{suffix}"
+
+
+def session(workflow=CLOUT_CUTS):
+    data = read_json(token_path(workflow))
     if not data:
-        raise ClipperError("Connect your channel first: python shorts.py connect client_secret.json")
+        raise ClipperError(f"Connect YouTube for {WORKFLOWS[workflow]} first: {connection_command(workflow)}")
     if not set(SCOPES).issubset(data.get("scopes", [])):
-        raise ClipperError("Reconnect with python shorts.py connect client_secret.json to enable thumbnail processing checks.")
+        raise ClipperError(f"Reconnect with {connection_command(workflow)} to enable thumbnail processing checks.")
     try:
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import AuthorizedSession
     except ImportError as error:
         raise ClipperError("Install requirements.txt before publishing.") from error
-    return AuthorizedSession(Credentials.from_authorized_user_info(data, SCOPES))
+    client = AuthorizedSession(Credentials.from_authorized_user_info(data, SCOPES))
+    try:
+        if workflow != MOVIE_RECAP:
+            verify_clout_channel(client)
+        return client
+    except Exception:
+        client.close()
+        raise
 
 
 def api_error(response):
@@ -201,7 +234,7 @@ def publish(client, folder, details, state, privacy, audience):
 def publish_with_thumbnail(client, folder, details, state, privacy, audience):
     import requests
 
-    thumbnail = folder / "thumbnail.jpg"
+    thumbnail = existing_thumbnail(folder)
     checksum = file_hash(thumbnail)
     ident = publish(client, folder, details, state, privacy, audience)
     receipt = state / "uploads" / (details["upload_key"] + ".json")

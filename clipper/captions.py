@@ -8,6 +8,7 @@ import unicodedata
 from dataclasses import astuple, dataclass, replace
 from functools import lru_cache
 
+from .workflows import CLOUT_CUTS, DYNAMIC_MODES, STREAMERS
 from .storage import ClipperError, digest, read_json, save_json
 
 
@@ -133,7 +134,7 @@ def phrase(words):
     return "".join(parts)
 
 
-def _pick_highlights(words, duration, seconds, count):
+def _pick_highlights(words, duration, seconds, count, workflow):
     maximum = seconds * 1000
     groups = []
     first = 0
@@ -149,6 +150,7 @@ def _pick_highlights(words, duration, seconds, count):
     for g, (lo, _) in enumerate(groups):
         speech = 0
         vocab = set()
+        reaction = question = False
         for h in range(g, len(groups)):
             begin, hi = groups[h]
             if h > g and words[begin].start - words[begin - 1].end > 2200:
@@ -169,12 +171,29 @@ def _pick_highlights(words, duration, seconds, count):
             score = (3.5 * length / maximum + 0.9 * bool(clean_start) + 1.15 * clean_end
                      + 0.55 * bool(hook) + 0.7 * speech / max(1, length)
                      + 0.30 * min(1.0, math.log1p(len(vocab)) / 3))
+            if workflow in DYNAMIC_MODES:
+                last = words[hi - 1].text
+                question |= any("?" in w.text for w in words[begin:hi])
+                reaction |= any(w.text.casefold().strip(".,!?") in {"wow", "wait", "whoa", "clutch", "unbelievable"}
+                                or "!" in w.text for w in words[begin:hi])
+                pause_after = hi == len(words) or words[hi].start - b >= 550
+                # Reward a complete beat, then favor ending at its first payoff.
+                context = 8000 if workflow == STREAMERS else 20000
+                score = (1.6 * bool(clean_start) + 2.3 * clean_end + 1.2 * pause_after
+                         + min(length / context, 1) + 0.8 * bool(hook)
+                         + 0.5 * speech / max(1, length) - 0.7 * length / maximum)
+                if workflow == STREAMERS:
+                    score += 1.6 * reaction + 0.8 * last.endswith("!")
+                else:
+                    score += 2.0 * (question and h > g and clean_end and "?" not in last)
             options.append((score, start, end, lo, hi))
 
     if not options:
         raise ClipperError("Could not fit a captioned passage into the requested clip length.")
     longest = max(end - start for _, start, end, _, _ in options)
     minimum = min(maximum * 0.48, longest * 0.90)
+    if workflow in DYNAMIC_MODES:
+        minimum = min(minimum, 5500 if workflow == STREAMERS else 12000)
     selected = []
     for _, start, end, lo, hi in sorted(options, key=lambda o: (-o[0], o[1])):
         if end - start < minimum or any(start < c.end and end > c.start for c in selected):
@@ -198,14 +217,14 @@ def _pick_highlights(words, duration, seconds, count):
     return sorted(selected, key=lambda c: c.start)
 
 
-def highlights(words, duration, seconds, count):
-    best = _pick_highlights(words, duration, seconds, count)
+def highlights(words, duration, seconds, count, workflow=CLOUT_CUTS):
+    best = _pick_highlights(words, duration, seconds, count, workflow)
     while len(best) < count and seconds > 5:
         # Shorter passages can fit between the starts of adjacent sentences.
         # Keep the longer selection when shortening does not yield more clips.
         seconds = max(5, int(seconds * 0.72))
         try:
-            selection = _pick_highlights(words, duration, seconds, count)
+            selection = _pick_highlights(words, duration, seconds, count, workflow)
         except ClipperError:
             break
         if len(selection) > len(best):
@@ -217,7 +236,7 @@ def width(text):
     return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
 
 
-def caption_groups(words):
+def caption_groups(words, max_words=7):
     # Choose breaks across each spoken phrase together, so a greedy split
     # cannot leave the final word flashing alone on the next caption.
     first = 0
@@ -230,7 +249,7 @@ def caption_groups(words):
         costs = [float("inf")] * n + [0.0]
         breaks = [0] * n
         for a in range(n - 1, -1, -1):
-            for b in range(a + 1, min(n, a + 7) + 1):
+            for b in range(a + 1, min(n, a + max_words) + 1):
                 chars = width(phrase(span[a:b]))
                 seconds = (span[b - 1].end - span[a].start) / 1000
                 if b > a + 1 and (chars > 36 or seconds > 2.8):
@@ -300,6 +319,8 @@ def ass_text(group, split, active, style):
         if i == active:
             emphasis = (r"{\c&H60EEFF&\fscx110\fscy110\t(0,100,\fscx100\fscy100)}"
                         if style == "pop" else r"{\c&H69E8FF&}")
+            if style == "stream-pop":
+                emphasis = r"{\c&H48FF9A&\fscx124\fscy124\t(0,140,\fscx100\fscy100)}"
             text = emphasis + text + r"{\r}"
         parts.append(text)
     return "".join(parts)
@@ -309,8 +330,10 @@ def write_captions(clip, folder, word_highlighting, style="classic"):
     header = ASS_HEADER
     if style == "pop":
         header = header.replace("Caption,Arial,76", "Caption,Arial,84").replace("1,4.4,1.5,2,", "1,6,2.5,2,")
+    if style == "stream-pop":
+        header = header.replace("Caption,Arial,76", "Caption,Arial,90").replace("1,4.4,1.5,2,", "1,7,3,2,")
     srt, events = [], [header]
-    for n, group in enumerate(caption_groups(clip.words), 1):
+    for n, group in enumerate(caption_groups(clip.words, 3 if style == "stream-pop" else 7), 1):
         split = line_split(group)
         text = "\n".join(phrase(part) for part in (group[:split], group[split:]) if part)
         start, end = group[0].start - clip.start, group[-1].end - clip.start
@@ -320,7 +343,7 @@ def write_captions(clip, folder, word_highlighting, style="classic"):
             b = group[i + 1].start - clip.start if i is not None and i + 1 < len(group) else end
             if clock(a, True) != clock(b, True):
                 line = ass_text(group, split, i, style)
-                if style == "pop" and i is None:
+                if style in ("pop", "stream-pop") and i is None:
                     # An SRT has phrase timing only. Animate the phrase as a unit.
                     line = r"{\fad(45,0)\c&H9AFAFF&}" + line
                 events.append(f"Dialogue: 0,{clock(a, True)},{clock(b, True)},Caption,,0,0,0,,{line}\n")

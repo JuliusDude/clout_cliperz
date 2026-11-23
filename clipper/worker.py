@@ -8,10 +8,12 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import publisher
+from .workflows import CLOUT_CUTS, DYNAMIC_MODES
 from .captions import highlights, transcript
 from .media import (EXTENSIONS, VIDEO_ID, channel_handle, channel_id, download, make_clip, probe,
                     resolve_handle, video_id, youtube_url)
-from .storage import ClipperError, cached_hash, digest, read_json, save_json, signature, work_lock
+from .storage import (ClipperError, cached_hash, clear_download_workspace, digest, existing_thumbnail,
+                      read_json, save_json, signature, temporary_downloads, work_lock)
 
 
 @dataclass
@@ -70,7 +72,7 @@ def finish_clips(source, clips, args, client, state):
                                         args.output, args.caption_style)
             source.check_unchanged()
             rendered += 1
-            print(f"Captioned Short: {folder / 'short.mp4'}\nThumbnail: {folder / 'thumbnail.jpg'}", flush=True)
+            print(f"Captioned Short: {folder / 'short.mp4'}\nThumbnail: {existing_thumbnail(folder)}", flush=True)
             if client is not None:
                 publisher.publish_with_thumbnail(client, folder, details, state, args.publish, args.audience)
             completed += 1
@@ -80,13 +82,14 @@ def finish_clips(source, clips, args, client, state):
 
 
 def run_source(source, args, client, state):
-    video = prepare_source(source, args, state)
-    chosen = highlights(video.words, video.duration, args.seconds, args.clips)
-    if len(chosen) < args.clips:
-        print(f"Found {len(chosen)} of {args.clips} requested nonoverlapping clips in {video.title}.", flush=True)
-    _, completed = finish_clips(video, chosen, args, client, state)
-    if completed != len(chosen):
-        raise ClipperError(f"Completed {completed} of {len(chosen)} clips. Rerun to finish the pending work.")
+    with temporary_downloads(state):
+        video = prepare_source(source, args, state)
+        chosen = highlights(video.words, video.duration, args.seconds, args.clips, args.workflow)
+        if len(chosen) < args.clips:
+            print(f"Found {len(chosen)} of {args.clips} requested nonoverlapping clips in {video.title}.", flush=True)
+        _, completed = finish_clips(video, chosen, args, client, state)
+        if completed != len(chosen):
+            raise ClipperError(f"Completed {completed} of {len(chosen)} clips. Rerun to finish the pending work.")
 
 
 def try_source(source, args, client, state):
@@ -107,6 +110,8 @@ def scan_folder(inbox, args, client, state):
     inbox.mkdir(parents=True, exist_ok=True)
     config = [str(inbox), args.model, args.language, args.seconds, args.clips,
               args.layout, args.publish, args.audience, args.caption_style]
+    if args.workflow in DYNAMIC_MODES:
+        config.append(args.workflow)
     marker = state / "folders" / (digest(json.dumps(config)) + ".json")
     seen = read_json(marker, {})
     files = sorted(p for p in inbox.iterdir() if p.is_file() and not p.name.startswith(".")
@@ -153,7 +158,9 @@ def channel_feed(channel):
 
 
 def scan_channel(channel, args, client, state):
-    marker = state / "channels" / (channel + ".json")
+    workflow = getattr(args, "workflow", CLOUT_CUTS)
+    prefix = workflow + "-" if workflow in DYNAMIC_MODES else ""
+    marker = state / "channels" / (prefix + channel + ".json")
     queue = read_json(marker)
     ok = True
     try:
@@ -200,6 +207,7 @@ def watch(args, client, state):
     while True:
         try:
             with work_lock(state):
+                clear_download_workspace(state)
                 if handle and not channel:
                     channel = resolve_handle(handle, state)
                 ok = scan_channel(channel, args, client, state) if channel else scan_folder(inbox, args, client, state)

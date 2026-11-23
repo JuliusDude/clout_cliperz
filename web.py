@@ -14,21 +14,26 @@ import signal
 import subprocess
 import sys
 from threading import Lock, Thread
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from clipper.batch import parse_links
 from clipper.media import channel_handle, channel_id, youtube_url
-from clipper.publisher import token_path
-from clipper.storage import ClipperError, read_json
+from clipper.publisher import connection_command, token_path
+from clipper.storage import ClipperError, clean_stopped_downloads, existing_thumbnail, read_json
+from clipper.workflows import (CLOUT_CUTS, DEFAULT_OUTPUT, MOVIE_RECAP, WORKFLOWS,
+                               default_caption, default_seconds, ensure_workflow_folders, workflow_output)
 
 ROOT = Path(__file__).resolve().parent
 
 
 def command(data, output):
+    workflow = data.get("workflow", CLOUT_CUTS)
+    if workflow not in WORKFLOWS:
+        raise ValueError("Choose a supported content mode.")
     mode = data.get("mode")
     source = data.get("source", "").strip()
     count = int(data.get("count", 3))
-    seconds = int(data.get("seconds", 35))
+    seconds = int(data.get("seconds", default_seconds(workflow)))
     if not 1 <= count <= 20 or not 5 <= seconds <= 180:
         raise ValueError("Choose 1–20 clips and a duration of 5–180 seconds.")
     if mode == "links":
@@ -41,44 +46,56 @@ def command(data, output):
             args.append("--include-latest")
     else:
         raise ValueError("Enter a YouTube channel handle, URL, or ID.")
-    caption = data.get("caption", "pop")
+    caption = data.get("caption", default_caption(workflow))
     visibility = data.get("visibility", "local")
-    if caption not in ("pop", "classic") or visibility not in ("local", "private", "unlisted", "public"):
+    if caption not in ("pop", "classic", "stream-pop") or visibility not in ("local", "private", "unlisted", "public"):
         raise ValueError("Choose a supported caption style and destination.")
-    args += ["--output", str(output), "--clips", str(count), "--seconds", str(seconds), "--caption-style", caption]
+    args += ["--workflow", workflow, "--output", str(output), "--clips", str(count),
+             "--seconds", str(seconds), "--caption-style", caption]
     if visibility != "local":
-        if not token_path().is_file():
-            raise ValueError("Connect YouTube first with python shorts.py connect client_secret.json.")
+        if not token_path(workflow).is_file():
+            raise ValueError(f"Connect YouTube for {WORKFLOWS[workflow]} first with {connection_command(workflow)}.")
         args += ["--publish", visibility]
     return [sys.executable, "-u", str(ROOT / "shorts.py"), *args]
 
 
 class Worker:
-    def __init__(self):
+    def __init__(self, output):
+        self.output = output
         self.lock = Lock()
         self.process = None
         self.status = "Ready"
+        self.workflow = None
         self.lines = deque(maxlen=200)
 
-    def start(self, args):
+    def start(self, args, workflow):
         with self.lock:
             if self.process is not None:
                 raise ValueError("Stop the current job before starting another.")
             proc = subprocess.Popen(args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+                                    stdin=subprocess.DEVNULL, env={**os.environ, "PYTHONIOENCODING": "utf-8"}, encoding="utf-8", errors="replace",
                                     start_new_session=os.name != "nt")
             self.process, self.status = proc, "Running"
+            self.workflow = WORKFLOWS[workflow]
             self.lines.clear()
-            Thread(target=self.collect, args=(proc,), daemon=True).start()
+            Thread(target=self.collect, args=(proc, workflow)).start()
 
-    def collect(self, proc):
+    def collect(self, proc, workflow):
         with proc.stdout:
             for line in proc.stdout:
                 with self.lock:
                     self.lines.append(line.rstrip()[:3000])
         code = proc.wait()
         with self.lock:
-            self.status = "Stopped" if self.status == "Stopping" else "Completed" if code == 0 else "Needs attention"
+            if self.status == "Stopping":
+                try:
+                    clean_stopped_downloads(workflow_output(self.output, workflow) / ".state")
+                    self.status = "Stopped"
+                except (OSError, ClipperError) as error:
+                    self.lines.append(f"Could not clean up the stopped job: {error}")
+                    self.status = "Needs attention"
+            else:
+                self.status = "Completed" if code == 0 else "Needs attention"
             self.process = None
 
     def stop(self):
@@ -97,7 +114,9 @@ class Worker:
 
 
 def serve(port, output):
-    worker = Worker()
+    for workflow in (CLOUT_CUTS, MOVIE_RECAP):
+        ensure_workflow_folders(workflow_output(output, workflow))
+    worker = Worker(output)
     token = secrets.token_urlsafe(32)
 
     class Handler(BaseHTTPRequestHandler):
@@ -119,34 +138,50 @@ def serve(port, output):
         def do_GET(self):
             if not self.local():
                 return
-            path = urlsplit(self.path).path
+            url = urlsplit(self.path)
+            path = url.path
             if path == "/api/status":
+                workflow = parse_qs(url.query).get("workflow", [CLOUT_CUTS])[0]
+                if workflow not in WORKFLOWS:
+                    self.reply({"error": "Choose a supported content mode."}, 400)
+                    return
+                library = workflow_output(output, workflow)
                 with worker.lock:
-                    result = {"status": worker.status, "active": worker.process is not None, "lines": list(worker.lines)}
-                folders = sorted((output / "clips").glob("*/details.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                    result = {"status": worker.status, "active": worker.process is not None,
+                              "jobWorkflow": worker.workflow, "lines": list(worker.lines)}
+                result["authorizationSaved"] = token_path(workflow).is_file()
+                folders = sorted((library / "clips").glob("*/details.json"),
+                                 key=lambda p: p.stat().st_mtime, reverse=True)
                 result["clips"] = []
                 for item in folders[:40]:
                     if not re.fullmatch(r"[a-f0-9]{12}-[a-f0-9]{12}", item.parent.name):
                         continue
                     try:
                         details = read_json(item, {})
-                        receipt = read_json(output / ".state" / "uploads" / (details["upload_key"] + ".json"), {})
+                        receipt = read_json(library / ".state" / "uploads" / (details["upload_key"] + ".json"), {})
                         result["clips"].append({"id": item.parent.name, "title": details["title"],
-                                                "videoId": receipt.get("video_id")})
+                                                "description": details.get("description", ""), "videoId": receipt.get("video_id")})
                     except (KeyError, OSError, ClipperError):
                         continue
                 self.reply(result)
                 return
             if path == "/":
-                self.reply((ROOT / "web/index.html").read_text().replace("__SESSION__", token).encode(),
+                self.reply((ROOT / "web/index.html").read_text(encoding="utf-8").replace("__SESSION__", token).encode(),
                            kind="text/html; charset=utf-8")
                 return
             static = {"/app.js": ROOT / "web/app.js", "/style.css": ROOT / "web/style.css",
                       "/example.jpg": ROOT / "examples/thumbnail.jpg"}
             file = static.get(path)
-            if re.fullmatch(r"/clips/[a-f0-9]{12}-[a-f0-9]{12}/(short.mp4|thumbnail.jpg|captions.srt)", path):
-                file = output / path.lstrip("/")
-                if not file.resolve().is_relative_to(output):
+            prefix = f"/{MOVIE_RECAP}/"
+            workflow = MOVIE_RECAP if path.startswith(prefix) else CLOUT_CUTS
+            clip_path = re.fullmatch(r"(clips/[a-f0-9]{12}-[a-f0-9]{12})/(short.mp4|thumbnail.jpg|captions.srt)",
+                                     path.removeprefix(prefix) if workflow == MOVIE_RECAP else path.removeprefix("/"))
+            if clip_path:
+                library = workflow_output(output, workflow)
+                folder = library / clip_path[1]
+                filename = clip_path[2]
+                file = existing_thumbnail(folder) if filename == "thumbnail.jpg" else folder / filename
+                if not file.resolve().is_relative_to(library):
                     file = None
             if file is None or not file.is_file():
                 self.send_error(404)
@@ -175,7 +210,10 @@ def serve(port, output):
                     data = json.loads(self.rfile.read(size))
                     if not isinstance(data, dict):
                         raise ValueError("Expected a job object.")
-                    worker.start(command(data, output))
+                    worker.start(command(data, output), data.get("workflow", CLOUT_CUTS))
+                elif self.path == "/api/connect":
+                    worker.start([sys.executable, "-u", str(ROOT / "shorts.py"), "connect",
+                                  "--workflow", CLOUT_CUTS], CLOUT_CUTS)
                 elif self.path == "/api/stop":
                     worker.stop()
                 else:
@@ -201,6 +239,6 @@ def serve(port, output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--output", type=Path, default=Path("shorts-output"))
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     options = parser.parse_args()
     serve(options.port, options.output.expanduser().resolve())

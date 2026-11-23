@@ -11,7 +11,7 @@ Follow a YouTube channel to turn new uploads into Shorts, or paste a batch of vi
 | Find videos | Follow checks a public channel feed every 60 seconds. Links mode takes a list once and distributes your requested count across the videos. | Internet for YouTube sources. You can also process your own local files. |
 | Transcribe | Faster-whisper runs the multilingual Whisper base model on your CPU. It detects the spoken language and timestamps individual words. | A one-time model download. Local transcription is free of per-minute API charges. A matching SRT file skips transcription. |
 | Select clips | The worker scores passages using sentence boundaries, pauses, continuous speech, and your duration limit. It selects distinct passages and reports a shortfall when the material is too short. | Local Python. Selection uses the transcript and timing. |
-| Render | FFmpeg reframes the video, burns in the captions, and makes a portrait JPEG from a frame inside that passage. The title and short description use words spoken in the clip. | FFmpeg with libass, disk space for cached sources and rendered clips, and CPU time. Longer inputs take more time. |
+| Render | FFmpeg reframes the video, burns in the captions, and makes a portrait JPEG from a frame inside that passage. The title and short description use words spoken in the clip. | FFmpeg with libass, disk space for temporary downloads and rendered clips, and CPU time. Longer inputs take more time. |
 | Post | The worker sends each MP4 to the channel you authorized. After YouTube finishes processing, it attaches the JPEG. Progress is saved so you can restart. | Internet, a Google Cloud project with YouTube Data API v3 enabled, Desktop OAuth authorization, and a channel eligible for custom thumbnails. API quota applies. [YouTube quota costs](https://developers.google.com/youtube/v3/determine_quota_cost) |
 
 Running on your own laptop uses its electricity, storage, and internet connection. The software has no subscription or per-clip fee. Local previews work without connecting Google. Keep the computer awake for continuous channel following. Hosting it on your own server is optional.
@@ -57,6 +57,8 @@ python shorts.py
 
 **Paste links** accepts a multiline paste. Set **Clip count**, then choose **Whole batch** or **Each video**. **Follow channel** accepts a channel URL, handle, or channel ID and applies your clip count to each new upload. Pick a caption style and destination, then start. **Save locally** lets you preview the MP4 and JPEG before connecting a channel. Keep Studio open while following. On headless machines, use the commands below. Linux desktop installs may need the Python Tk package.
 
+Choose **Clout-Cuts** for creator highlights or **Movie-Recap** for highlights from an existing narrated recap. Both modes select passages using the source transcript. Use **Connect YouTube** with the intended mode selected to authorize its destination channel.
+
 ### Paste a batch in the terminal
 
 ~~~sh
@@ -96,7 +98,13 @@ Leave the worker running. It checks every 60 seconds. The first spoken video dow
 
 [View an example thumbnail generated from an original narrated clip.](examples/thumbnail.jpg)
 
-The output is under `shorts-output/clips/`. Each folder contains `short.mp4`, `thumbnail.jpg`, `captions.srt`, and `details.json` with the title and source time range. A successful upload prints its YouTube Shorts link. The worker confirms when it has attached the cover.
+On Windows the channel folders are `G:\Clout-Cuts` and `G:\Movie-Recap`. On macOS and Linux they are under `shorts-output/`. Each channel folder contains:
+
+- `originals/` holds temporary YouTube downloads while a job runs. The clipper clears its temporary downloads after the job. Files you supply directly or place in an inbox remain in place.
+- `clips/<clip-id>/` contains `short.mp4`, `captions.srt`, and `details.json` with the title and source time range.
+- `thumbnails/<clip-id>.jpg` contains the matching cover.
+
+A successful upload prints its YouTube Shorts link. The worker confirms when it has attached the cover.
 
 ## Controls
 
@@ -110,7 +118,8 @@ The output is under `shorts-output/clips/`. Each folder contains `short.mp4`, `t
 | `--model small` | Use another faster-whisper model. The default is the multilingual `base` CPU model. A downloaded model directory also works. |
 | `--interval 300` | Check the source every five minutes. |
 | `--once` | Scan once and exit. Use with Task Scheduler, launchd, or cron on a computer with the same output folder and credentials. |
-| `--output PATH` | Set the directory for clips, cached inputs, the feed queue, and upload receipts. Reuse it across restarts. |
+| `--output PATH` | Set the base directory containing both channel folders. Reuse it across restarts. |
+| `--workflow movie-recap` | Use the Movie-Recap library, worker state, and YouTube authorization. Clout-Cuts is the default. |
 
 A single file or a single YouTube video URL also works with `run`.
 
@@ -139,27 +148,33 @@ For a periodic task on another OS, point the scheduler at the virtual environmen
 
 ## Restarts and uploads
 
-Keep `shorts-output/.state` with the project. It holds the feed queue and per-clip upload receipts. The worker resumes interrupted uploads and skips previously uploaded clips with the same source content and time range. One worker uses an output directory at a time. Use a separate output directory when switching destination channels.
+Keep each channel folder's `.state/` directory. It holds transcripts, the feed queue, and upload receipts. The worker resumes interrupted uploads and skips previously uploaded clips with the same source content and time range. A retry can download the source again. One worker uses a channel folder at a time.
 
 The video ID is saved before thumbnail processing starts. If processing takes longer than the polling window or the thumbnail request fails, rerun the same job to retry the cover on the existing video. The continuous watcher retries automatically.
 
 If YouTube accepts a final chunk and its response is lost, the worker asks the existing upload session for the result. If that session has expired, it pauses that clip. Find the title in YouTube Studio, then run one of the following commands using the generated clip folder. Use `--retry` only after confirming the clip is absent from Studio.
 
 ~~~sh
-python shorts.py reconcile "shorts-output/clips/CLIP_FOLDER" --video-id EXISTING_ID
-python shorts.py reconcile "shorts-output/clips/CLIP_FOLDER" --retry
+python shorts.py reconcile "G:/Clout-Cuts/clips/CLIP_FOLDER" --video-id EXISTING_ID
+python shorts.py reconcile "G:/Clout-Cuts/clips/CLIP_FOLDER" --retry
 ~~~
 
-The Google token is stored under your user configuration directory in `shorts-clipper/youtube.json`. Set `SHORTS_CLIPPER_TOKEN` to choose a different token file. Keep the token, client JSON, and upload session state private.
+Clout-Cuts uses `shorts-clipper/youtube.json` under your user configuration directory. Set `SHORTS_CLIPPER_TOKEN` to override that token path. Movie-Recap uses `shorts-clipper/youtube-movie-recap.json`. Set `SHORTS_CLIPPER_MOVIE_RECAP_TOKEN` to override that token path. Authorize the Movie-Recap channel with `python shorts.py connect client_secret.json --workflow movie-recap`. Keep tokens, client JSON, and upload session state private.
 
 To run the regression checks, use `python -m unittest discover -s tests -v` in the activated environment.
+
+## Streamers and Podcast
+
+In the dashboard, select **Streamers** for reactions and short payoffs or **Podcast** for questions and answers. Supply YouTube video links or follow a YouTube channel handle. Finished stream replays can be clipped once they are available as videos. The worker ranks transcript passages using speech timing, punctuation, and mode-specific cues. Clip length follows the passage, with editable ceilings of 60 seconds for Streamers and 120 seconds for Podcast. Streamers starts with short groups of animated captions; Podcast starts with Classic captions.
+
+Both modes use the Clout-Cuts library on G: and upload to **@Clout-CutsTV**. Choose **Connect @Clout-CutsTV** on the local dashboard, select your Desktop OAuth client JSON if prompted, and choose the channel in Google's consent screen. Once authorized, start a job with the desired visibility. The worker creates the description from the transcript and source credit, renders the Short and cover, uploads the video, and applies the thumbnail when YouTube finishes processing. To have Groq write the description, set `GROQ_API_KEY` in the server environment before launch. Only the selected transcript excerpt is sent to Groq. The worker uses the local excerpt if Groq is unavailable. The dashboard defaults to private uploads. Choose **Save locally** for a preview.
 
 ## Browser dashboard
 
 Run `python web.py` from the repository after installing the worker dependencies. Open
-[the local dashboard](http://127.0.0.1:8765) on the same computer. The page shares
-the worker's output folder and YouTube authorization. Choose **Save locally** to
-generate clips without connecting YouTube. Use the setup above to enable posting.
+[the local dashboard](http://127.0.0.1:8765) on the same computer. Choose
+**Clout-Cuts** or **Movie-Recap** to select the job's workflow and preview that mode's library.
+Choose **Save locally** to generate clips without connecting YouTube. Use the setup above to enable posting.
 
 The dashboard runs one job at a time. Closing the browser leaves the job running
 while the server stays on. **Stop job** stops the active batch or watcher. Stop

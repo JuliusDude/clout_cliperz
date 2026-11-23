@@ -8,8 +8,9 @@ from pathlib import Path
 from clipper import publisher
 from clipper.batch import read_links, run_batch
 from clipper.media import check_tools
-from clipper.storage import ClipperError, work_lock
+from clipper.storage import ClipperError, temporary_downloads, work_lock
 from clipper.worker import run_source, watch
+from clipper.workflows import CLOUT_CUTS, DEFAULT_OUTPUT, WORKFLOWS, default_caption, default_seconds, ensure_workflow_folders, workflow_output
 
 
 def bounded(low, high):
@@ -22,12 +23,17 @@ def bounded(low, high):
 
 
 def arguments():
+    def workflow_option(command):
+        command.add_argument("--workflow", choices=WORKFLOWS, default=CLOUT_CUTS,
+                             help="select the clip mode and its destination channel")
+
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command")
     studio = commands.add_parser("studio", help="open the desktop controls for links and channel following")
-    studio.add_argument("--output", type=Path, default=Path("shorts-output"))
+    studio.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     auth = commands.add_parser("connect", help="authorize the destination YouTube channel once")
-    auth.add_argument("client_file", type=Path, help="Google Desktop OAuth client JSON")
+    auth.add_argument("client_file", type=Path, nargs="?", help="Google Desktop OAuth client JSON")
+    workflow_option(auth)
     recovery = commands.add_parser("reconcile", help="resolve an uncertain final upload after checking Studio")
     recovery.add_argument("clip_folder", type=Path, help="generated folder containing details.json")
     outcome = recovery.add_mutually_exclusive_group(required=True)
@@ -51,15 +57,16 @@ def arguments():
         command.add_argument("--include-latest", action="store_true",
                              help="also process the latest existing upload when first registering a channel")
     for command in (single, watcher, batch, follow):
-        command.add_argument("--output", type=Path, default=Path("shorts-output"),
-                             help="persistent clips, source cache and posting history")
+        workflow_option(command)
+        command.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
+                             help="base directory for both channel folders and their posting history")
         command.add_argument("--clips", type=bounded(1, 20), default=1,
                              help="requested highlights per source, or per batch in links mode (default 1)")
-        command.add_argument("--seconds", type=bounded(5, 180), default=35,
-                             help="maximum clip duration in seconds (default 35)")
+        command.add_argument("--seconds", type=bounded(5, 180),
+                             help="maximum duration in seconds (defaults depend on the mode)")
         command.add_argument("--layout", choices=["fit", "crop"], default="fit",
                              help="keep full picture over blurred fill, or center-crop (default fit)")
-        command.add_argument("--caption-style", choices=["pop", "classic"], default="pop",
+        command.add_argument("--caption-style", choices=["pop", "classic", "stream-pop"],
                              help="animated high-contrast captions or the original style")
         command.add_argument("--model", default="base", help="faster-whisper model name or local directory")
         command.add_argument("--language", help="spoken language code, e.g. en or es (default auto-detect)")
@@ -74,24 +81,41 @@ def main():
     args = arguments()
     if args.command in (None, "studio"):
         from clipper.studio import launch
-        return launch(getattr(args, "output", Path("shorts-output")).expanduser().resolve())
+        return launch(getattr(args, "output", DEFAULT_OUTPUT).expanduser().resolve())
     if args.command == "connect":
-        publisher.connect(args.client_file.expanduser())
+        client_file = args.client_file or Path("client_secret.json")
+        if args.client_file is None and not client_file.is_file():
+            from tkinter import Tk, filedialog
+            root = Tk()
+            root.withdraw()
+            try:
+                filename = filedialog.askopenfilename(parent=root, title="Choose Google Desktop OAuth client JSON",
+                                                      filetypes=[("OAuth client", "*.json")])
+            finally:
+                root.destroy()
+            if not filename:
+                raise ClipperError("Channel connection cancelled.")
+            client_file = Path(filename)
+        publisher.connect(client_file.expanduser(), args.workflow)
         return 0
     if args.command == "reconcile":
         publisher.reconcile(args.clip_folder, args.video_id)
         return 0
+    args.seconds = args.seconds or default_seconds(args.workflow)
+    args.caption_style = args.caption_style or default_caption(args.workflow)
     check_tools()
     ids = read_links(args) if args.command == "links" else None
-    args.output = args.output.expanduser().resolve()
+    args.output = workflow_output(args.output.expanduser().resolve(), args.workflow)
+    ensure_workflow_folders(args.output)
     state = args.output / ".state"
-    client = publisher.session() if args.publish else None
+    client = publisher.session(args.workflow) if args.publish else None
     try:
         if args.command in ("watch", "follow"):
             return watch(args, client, state)
         with work_lock(state):
             if ids is not None:
-                return run_batch(ids, args, client, state)
+                with temporary_downloads(state):
+                    return run_batch(ids, args, client, state)
             run_source(args.source, args, client, state)
         return 0
     finally:

@@ -7,6 +7,7 @@ import sys
 from .captions import Clip, highlights
 from .media import video_id, youtube_url
 from .storage import ClipperError, digest, read_json, save_json
+from .workflows import CLOUT_CUTS, DYNAMIC_MODES
 from .worker import finish_clips, prepare_source
 
 
@@ -53,7 +54,11 @@ def allocate(capacities, total):
 
 def run_batch(ids, args, client, state):
     target = args.clips * len(ids) if args.per_video else args.clips
-    key = digest(json.dumps([ids, args.clips, args.per_video, args.seconds, args.model, args.language]))
+    workflow = getattr(args, "workflow", CLOUT_CUTS)
+    settings = [ids, args.clips, args.per_video, args.seconds, args.model, args.language]
+    if workflow in DYNAMIC_MODES:
+        settings.append(workflow)
+    key = digest(json.dumps(settings))
     marker = state / "batches" / (key + ".json")
     plans = read_json(marker, {})
     remaining = target - sum(len(p["ranges"]) for p in plans.values())
@@ -72,7 +77,7 @@ def run_batch(ids, args, client, state):
                 print(f"Skipping duplicate video content: {youtube_url(ident)}", flush=True)
                 continue
             count = args.clips if args.per_video else remaining
-            pools[ident] = highlights(source.words, source.duration, args.seconds, count)
+            pools[ident] = highlights(source.words, source.duration, args.seconds, count, workflow)
             prepared[ident] = source
             known_content.add(source.media_id)
         except Exception as error:
@@ -85,7 +90,7 @@ def run_batch(ids, args, client, state):
         chosen = pools[ident]
         if 0 < count < len(chosen):
             # Refit the awarded number of passages at the preferred duration.
-            fitted = highlights(source.words, source.duration, args.seconds, count)
+            fitted = highlights(source.words, source.duration, args.seconds, count, workflow)
             chosen = fitted if len(fitted) == count else chosen[:count]
         plans[ident] = {"media_id": source.media_id, "ranges": [[c.start, c.end] for c in chosen[:count]]}
     save_json(marker, plans)

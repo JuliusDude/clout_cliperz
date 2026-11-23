@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -10,6 +11,43 @@ from pathlib import Path
 
 class ClipperError(Exception):
     pass
+
+
+def download_workspace(state):
+    return state.parent / "originals" / ".clipper-downloads"
+
+
+def clear_download_workspace(state):
+    folder = download_workspace(state).absolute()
+    if folder.resolve() != folder or folder.is_symlink():
+        raise ClipperError(f"The temporary download folder must be inside {state.parent / 'originals'}.")
+    if folder.exists():
+        shutil.rmtree(folder)
+
+
+@contextmanager
+def temporary_downloads(state):
+    # Call under the workflow's worker lock.
+    clear_download_workspace(state)
+    try:
+        yield
+    finally:
+        clear_download_workspace(state)
+
+
+def clean_stopped_downloads(state):
+    """Clean up after a supervisor has stopped the worker process tree."""
+    with work_lock(state):
+        clear_download_workspace(state)
+
+
+def thumbnail_path(folder):
+    return folder.parent.parent / "thumbnails" / f"{folder.name}.jpg"
+
+
+def existing_thumbnail(folder):
+    thumbnail = thumbnail_path(folder)
+    return thumbnail if thumbnail.is_file() else folder / "thumbnail.jpg"
 
 
 def read_json(path, default=None):

@@ -10,7 +10,8 @@ from pathlib import Path
 
 from .batch import parse_links
 from .media import channel_handle, channel_id
-from .storage import ClipperError
+from .storage import ClipperError, clean_stopped_downloads
+from .workflows import CLOUT_CUTS, MOVIE_RECAP, WORKFLOWS, default_caption, ensure_workflow_folders, workflow_output
 
 
 def launch(output):
@@ -22,6 +23,8 @@ def launch(output):
         raise ClipperError("Install Python with Tk support or use the links and follow commands.") from error
     except Exception as error:
         raise ClipperError("A desktop display is needed for Studio. The links and follow commands work in a terminal.") from error
+    for content_mode in WORKFLOWS:
+        ensure_workflow_folders(workflow_output(output, content_mode))
 
     root.title("Shorts Studio")
     root.geometry("760x640")
@@ -53,13 +56,20 @@ def launch(output):
     ttk.Label(header, text="Shorts Studio", style="Heading.TLabel").grid(row=0, column=0, sticky="w")
     connect_button = ttk.Button(header, text="Connect YouTube")
     connect_button.grid(row=0, column=1)
+    workflow = tk.StringVar(value=CLOUT_CUTS)
+    workflows = ttk.Frame(header)
+    workflows.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+    ttk.Label(workflows, text="Content mode").grid(row=0, column=0, padx=(0, 9))
+    for column, (value, label) in enumerate(WORKFLOWS.items(), start=1):
+        ttk.Radiobutton(workflows, text=label, value=value, variable=workflow).grid(row=0, column=column, padx=(0, 9))
     tabs = ttk.Notebook(panel)
     tabs.grid(row=1, column=0, sticky="ew")
     links_tab, follow_tab = ttk.Frame(tabs, padding=15), ttk.Frame(tabs, padding=15)
     for tab, label in ((links_tab, "Paste links"), (follow_tab, "Follow channel")):
         tab.columnconfigure(0, weight=1)
         tabs.add(tab, text=label)
-    ttk.Label(links_tab, text="YouTube video links").grid(row=0, column=0, sticky="w")
+    source_label = ttk.Label(links_tab)
+    source_label.grid(row=0, column=0, sticky="w")
     urls = tk.Text(links_tab, height=4, wrap="word", font=(family, 11), relief="solid", borderwidth=1,
                    background="white", foreground=ink, padx=8, pady=6, undo=True)
     urls.grid(row=1, column=0, sticky="ew", pady=(6, 0))
@@ -85,7 +95,7 @@ def launch(output):
         return box
 
     scope = choice(1, ("Whole batch", "Each video"))
-    captions = choice(2, ("Pop", "Classic"))
+    captions = choice(2, ("Pop", "Classic", "Stream-pop"))
     visibility = choice(3, ("YouTube public", "YouTube unlisted", "YouTube private", "Save locally"))
     actions = ttk.Frame(panel)
     actions.grid(row=3, column=0, sticky="ew", pady=(0, 14))
@@ -109,6 +119,7 @@ def launch(output):
         return tabs.select() == str(follow_tab)
 
     def mode_changed(*_):
+        source_label.configure(text="Narrated recap video links" if workflow.get() == MOVIE_RECAP else "Creator video links")
         scope.configure(state="disabled" if following() else "readonly")
         if following():
             scope.set("Each new upload")
@@ -129,6 +140,7 @@ def launch(output):
         if process is not None:
             return
         entry = Path(__file__).resolve().parents[1] / "shorts.py"
+        state = workflow_output(output, workflow.get()) / ".state" if arguments[0] != "connect" else None
         proc = subprocess.Popen([sys.executable, "-u", str(entry), *arguments],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace",
@@ -149,9 +161,15 @@ def launch(output):
             with proc.stdout:
                 for line in proc.stdout:
                     events.put(line)
-            events.put(proc.wait())
+            code = proc.wait()
+            if stopping and state is not None:
+                try:
+                    clean_stopped_downloads(state)
+                except (OSError, ClipperError) as error:
+                    events.put(f"Could not clean up the stopped job: {error}\n")
+            events.put(code)
 
-        threading.Thread(target=collect, daemon=True).start()
+        threading.Thread(target=collect).start()
 
     def drain():
         nonlocal process
@@ -193,7 +211,8 @@ def launch(output):
                 arguments = ["links"]
                 if scope.get() == "Each video":
                     arguments.append("--per-video")
-            arguments.extend(["--clips", str(chosen), "--caption-style", captions.get().lower(), "--output", str(output)])
+            arguments.extend(["--workflow", workflow.get(), "--clips", str(chosen),
+                              "--caption-style", captions.get().lower(), "--output", str(output)])
             if visibility.get() != "Save locally":
                 arguments.extend(["--publish", visibility.get().split()[-1]])
             spawn(arguments, text)
@@ -217,10 +236,10 @@ def launch(output):
     def connect():
         path = filedialog.askopenfilename(title="Google Desktop OAuth client", filetypes=[("OAuth client JSON", "*.json")])
         if path:
-            spawn(["connect", path])
+            spawn(["connect", path, "--workflow", workflow.get()])
 
     def reveal():
-        folder = output / "clips"
+        folder = workflow_output(output, workflow.get()) / "clips"
         if not folder.is_dir():
             messagebox.showinfo("Clips folder", f"Your first clips will appear in {folder}.", parent=root)
         elif os.name == "nt":
@@ -240,6 +259,11 @@ def launch(output):
     connect_button.configure(command=connect)
     open_clips.configure(command=reveal)
     tabs.bind("<<NotebookTabChanged>>", mode_changed)
+    def workflow_changed(*_):
+        captions.set(default_caption(workflow.get()).capitalize())
+        mode_changed()
+
+    workflow.trace_add("write", workflow_changed)
     root.protocol("WM_DELETE_WINDOW", close)
     mode_changed()
     drain()
